@@ -13,10 +13,12 @@ FROM node:22-bookworm-slim
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-COPY packages/medvault-core ./packages/medvault-core
+COPY packages/medvault-core/package.json packages/medvault-core/package.json
+COPY packages/medvault-core/data ./packages/medvault-core/data
+COPY --from=build /app/packages/medvault-core/dist ./packages/medvault-core/dist
 COPY --from=build /app/dist ./dist
 
-RUN npm ci --omit=dev && npm run build:core
+RUN npm ci --omit=dev
 
 ENV INDEXER_PORT=3300
 EXPOSE 3300
