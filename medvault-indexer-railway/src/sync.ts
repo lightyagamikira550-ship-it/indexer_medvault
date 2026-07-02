@@ -88,6 +88,20 @@ const SUBGRAPH_REWARDS = `
   }
 `;
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return (
+    text.includes("Too Many Requests") ||
+    text.includes("-32005") ||
+    text.includes("rate limit") ||
+    text.includes("BAD_DATA")
+  );
+}
+
 export class IndexerSync {
   private provider: ethers.JsonRpcProvider;
   private lastSyncedBlock = 0;
@@ -112,9 +126,21 @@ export class IndexerSync {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    const head = await this.provider.getBlockNumber();
-    this.lastSyncedBlock = Math.max(0, head - 500);
-    await this.syncOnce();
+
+    if (this.config.rpcSyncEnabled) {
+      try {
+        const head = await this.provider.getBlockNumber();
+        this.lastSyncedBlock = Math.max(0, head - this.config.rpcLookbackBlocks);
+      } catch (err) {
+        console.warn("[IndexerSync] RPC head lookup failed; subgraph-only until next tick", err);
+      }
+    }
+
+    try {
+      await this.syncOnce();
+    } catch (err) {
+      console.error("[IndexerSync] initial sync error (API already up)", err);
+    }
     this.schedule();
   }
 
@@ -135,7 +161,13 @@ export class IndexerSync {
   }
 
   async syncOnce(): Promise<void> {
-    await Promise.all([this.syncFromSubgraph(), this.syncFromRpc()]);
+    await this.syncFromSubgraph();
+    if (!this.config.rpcSyncEnabled) return;
+    try {
+      await this.syncFromRpc();
+    } catch (err) {
+      console.warn("[IndexerSync] RPC sync skipped this tick", err);
+    }
   }
 
   private async paginateSubgraph<T>(
@@ -245,62 +277,67 @@ export class IndexerSync {
     const from = this.lastSyncedBlock + 1;
     if (from > head) return;
 
-    const to = Math.min(head, from + 2000);
+    const chunk = Math.max(1, this.config.rpcChunkBlocks);
+    const to = Math.min(head, from + chunk - 1);
     const invalidatedTags = new Set<string>();
+    const minimal = this.config.rpcMinimal;
 
-    await this.scanContract(
-      this.config.contracts.trialManager,
-      TRIAL_MANAGER_ABI,
-      "TrialCreated",
-      from,
-      to,
-      async (log, parsed) => {
-        const trialId = parsed.args.trialId.toString();
-        const sponsor = String(parsed.args.sponsor).toLowerCase();
-        const key = eventKey(log.transactionHash, log.index);
-        await this.db.upsertTrial({
-          _id: trialId,
-          trialId,
-          sponsor,
-          name: parsed.args.name,
-          active: true,
-          endTime: parsed.args.endTime.toString(),
-          encryptedCriteria: Boolean(parsed.args.encryptedCriteria),
-          eventKey: key,
-          source: "rpc",
-          updatedAt: Date.now(),
-        });
-        invalidatedTags.add("trials");
-        invalidatedTags.add(`sponsor:${sponsor}`);
-      }
-    );
+    if (!minimal) {
+      await this.scanContract(
+        this.config.contracts.trialManager,
+        TRIAL_MANAGER_ABI,
+        "TrialCreated",
+        from,
+        to,
+        async (log, parsed) => {
+          const trialId = parsed.args.trialId.toString();
+          const sponsor = String(parsed.args.sponsor).toLowerCase();
+          const key = eventKey(log.transactionHash, log.index);
+          await this.db.upsertTrial({
+            _id: trialId,
+            trialId,
+            sponsor,
+            name: parsed.args.name,
+            active: true,
+            endTime: parsed.args.endTime.toString(),
+            encryptedCriteria: Boolean(parsed.args.encryptedCriteria),
+            eventKey: key,
+            source: "rpc",
+            updatedAt: Date.now(),
+          });
+          invalidatedTags.add("trials");
+          invalidatedTags.add(`sponsor:${sponsor}`);
+        }
+      );
 
-    await this.scanContract(
-      this.config.contracts.eligibilityEngine,
-      ELIGIBILITY_ENGINE_ABI,
-      "EligibilityProofVerified",
-      from,
-      to,
-      async (log, parsed) => {
-        const trialId = parsed.args.trialId.toString();
-        const nullifier = parsed.args.nullifier.toString();
-        const id = `${nullifier}-${trialId}`;
-        const key = eventKey(log.transactionHash, log.index);
-        await this.db.upsertApplication({
-          _id: id,
-          trialId,
-          nullifier,
-          status: parsed.args.eligible ? "Pending" : "Rejected",
-          submittedAt: String((await log.getBlock())?.timestamp ?? 0),
-          eventKey: key,
-          source: "rpc",
-          updatedAt: Date.now(),
-        });
-        invalidatedTags.add(`applications:${trialId}`);
-        invalidatedTags.add("trials");
-      }
-    );
+      await this.scanContract(
+        this.config.contracts.eligibilityEngine,
+        ELIGIBILITY_ENGINE_ABI,
+        "EligibilityProofVerified",
+        from,
+        to,
+        async (log, parsed) => {
+          const trialId = parsed.args.trialId.toString();
+          const nullifier = parsed.args.nullifier.toString();
+          const id = `${nullifier}-${trialId}`;
+          const key = eventKey(log.transactionHash, log.index);
+          await this.db.upsertApplication({
+            _id: id,
+            trialId,
+            nullifier,
+            status: parsed.args.eligible ? "Pending" : "Rejected",
+            submittedAt: String((await log.getBlock())?.timestamp ?? 0),
+            eventKey: key,
+            source: "rpc",
+            updatedAt: Date.now(),
+          });
+          invalidatedTags.add(`applications:${trialId}`);
+          invalidatedTags.add("trials");
+        }
+      );
+    }
 
+    // RPC-only: not in hosted subgraph schema
     await this.scanContract(
       this.config.contracts.eligibilityEngine,
       ELIGIBILITY_ENGINE_ABI,
@@ -326,68 +363,70 @@ export class IndexerSync {
       }
     );
 
-    await this.scanContract(
-      this.config.contracts.consentManager,
-      CONSENT_MANAGER_ABI,
-      "ConsentChanged",
-      from,
-      to,
-      async (log) => {
-        const key = eventKey(log.transactionHash, log.index);
-        const block = await log.getBlock();
-        await this.db.upsertConsent({
-          _id: key,
-          trialId: "0",
-          patient: ethers.ZeroAddress,
-          granted: true,
-          eventKey: key,
-          source: "rpc",
-          updatedAt: block?.timestamp ?? Date.now(),
-        });
-        invalidatedTags.add("trials");
-      }
-    );
+    if (!minimal) {
+      await this.scanContract(
+        this.config.contracts.consentManager,
+        CONSENT_MANAGER_ABI,
+        "ConsentChanged",
+        from,
+        to,
+        async (log) => {
+          const key = eventKey(log.transactionHash, log.index);
+          const block = await log.getBlock();
+          await this.db.upsertConsent({
+            _id: key,
+            trialId: "0",
+            patient: ethers.ZeroAddress,
+            granted: true,
+            eventKey: key,
+            source: "rpc",
+            updatedAt: block?.timestamp ?? Date.now(),
+          });
+          invalidatedTags.add("trials");
+        }
+      );
 
-    await this.scanContract(
-      this.config.contracts.sponsorIncentiveVault,
-      VAULT_ABI,
-      "RewardsDistributed",
-      from,
-      to,
-      async (log, parsed) => {
-        const trialId = parsed.args.trialId.toString();
-        const key = eventKey(log.transactionHash, log.index);
-        await this.db.upsertReward({
-          _id: key,
-          trialId,
-          eventKey: key,
-          source: "rpc",
-          updatedAt: Date.now(),
-        });
-        invalidatedTags.add(`trial:${trialId}`);
-      }
-    );
+      await this.scanContract(
+        this.config.contracts.sponsorIncentiveVault,
+        VAULT_ABI,
+        "RewardsDistributed",
+        from,
+        to,
+        async (log, parsed) => {
+          const trialId = parsed.args.trialId.toString();
+          const key = eventKey(log.transactionHash, log.index);
+          await this.db.upsertReward({
+            _id: key,
+            trialId,
+            eventKey: key,
+            source: "rpc",
+            updatedAt: Date.now(),
+          });
+          invalidatedTags.add(`trial:${trialId}`);
+        }
+      );
 
-    await this.scanContract(
-      this.config.contracts.sponsorIncentiveVault,
-      VAULT_ABI,
-      "MilestoneRewardsDistributed",
-      from,
-      to,
-      async (log, parsed) => {
-        const trialId = parsed.args.trialId.toString();
-        const key = eventKey(log.transactionHash, log.index);
-        await this.db.upsertReward({
-          _id: key,
-          trialId,
-          milestoneIndex: Number(parsed.args.milestoneIndex),
-          eventKey: key,
-          source: "rpc",
-          updatedAt: Date.now(),
-        });
-        invalidatedTags.add(`trial:${trialId}`);
-      }
-    );
+      await this.scanContract(
+        this.config.contracts.sponsorIncentiveVault,
+        VAULT_ABI,
+        "MilestoneRewardsDistributed",
+        from,
+        to,
+        async (log, parsed) => {
+          const trialId = parsed.args.trialId.toString();
+          const key = eventKey(log.transactionHash, log.index);
+          await this.db.upsertReward({
+            _id: key,
+            trialId,
+            milestoneIndex: Number(parsed.args.milestoneIndex),
+            eventKey: key,
+            source: "rpc",
+            updatedAt: Date.now(),
+          });
+          invalidatedTags.add(`trial:${trialId}`);
+        }
+      );
+    }
 
     const docAddr = this.config.contracts.patientDocumentStore;
     if (docAddr && docAddr !== ethers.ZeroAddress) {
@@ -453,11 +492,29 @@ export class IndexerSync {
   ): Promise<void> {
     const iface = new ethers.Interface(abi);
     const topic = iface.getEvent(eventName)!.topicHash;
-    const logs = await this.provider.getLogs({ address, fromBlock: from, toBlock: to, topics: [topic] });
+    const logs = await this.getLogsWithRetry({ address, fromBlock: from, toBlock: to, topics: [topic] });
     for (const log of logs) {
       const parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
       if (!parsed) continue;
       await handler(log, parsed);
     }
+    if (this.config.rpcScanDelayMs > 0) {
+      await sleep(this.config.rpcScanDelayMs);
+    }
+  }
+
+  private async getLogsWithRetry(filter: ethers.Filter): Promise<ethers.Log[]> {
+    const maxAttempts = 4;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await this.provider.getLogs(filter);
+      } catch (err) {
+        if (!isRateLimitError(err) || attempt === maxAttempts - 1) throw err;
+        const backoff = this.config.rpcScanDelayMs * (attempt + 2);
+        console.warn(`[IndexerSync] getLogs rate-limited, retry in ${backoff}ms`, err);
+        await sleep(backoff);
+      }
+    }
+    return [];
   }
 }
