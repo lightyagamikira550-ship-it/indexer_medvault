@@ -1,0 +1,33 @@
+{
+  "name": "@medvault/indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./lib": "./dist/exports.js"
+  },
+  "scripts": {
+    "build:core": "npm run build --prefix packages/medvault-core",
+    "build": "npm run build:core && tsup src/index.ts src/exports.ts --format esm --clean",
+    "dev": "npm run build:core && tsup src/index.ts --format esm --watch --onSuccess \"node dist/index.js\"",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@medvault/core": "file:./packages/medvault-core",
+    "dotenv": "^17.3.1",
+    "ethers": "6.16.0",
+    "express": "^4.21.0",
+    "mongodb": "^6.16.0",
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

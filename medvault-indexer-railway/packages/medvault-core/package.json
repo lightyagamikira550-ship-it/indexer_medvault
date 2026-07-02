@@ -1,0 +1,43 @@
+{
+  "name": "@medvault/core",
+  "version": "0.1.0",
+  "description": "Core protocol helpers for MedVault — contracts, ABIs, and sponsor adapters on Ethereum Sepolia",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "data"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shery8595/Med-Vault.git",
+    "directory": "packages/medvault-core"
+  },
+  "license": "BSD-3-Clause-Clear",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --external ethers",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ethers": "6.16.0"
+  },
+  "peerDependencies": {
+    "@zama-fhe/relayer-sdk": ">=0.4.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3"
+  }
+}
