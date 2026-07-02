@@ -17,9 +17,12 @@ async function main(): Promise<void> {
   const reconcile = new IndexerReconcile(config, db);
   const app = createIndexerApi(config, db, cache);
 
-  await sync.start();
-  reconcile.start();
+  // Start HTTP API first so /health works even if RPC sync is slow or rate-limited.
   startIndexerApi(app, config.port);
+  reconcile.start();
+  void sync.start().catch((err) => {
+    console.error("[IndexerSync] background start error", err);
+  });
 
   const shutdown = async () => {
     sync.stop();
